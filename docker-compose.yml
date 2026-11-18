@@ -1,11 +1,13 @@
 # 双代理熔断器演练：
 #   redis    共享熔断状态（AOF 持久化，重启不提前放行）
 #   backend  本地模拟诊断后端（normal / timeout 两种模式）
-#   proxy-a、proxy-b 两份代理实例，合计统计连续超时
+#   proxy-a、proxy-b 两份代理实例，合计统计连续超时、共享同一份探测租约
 #   web      运维操作网页（http://localhost:8080）
+#
+# 启动：docker compose up --build
 services:
   redis:
-    image: redis:7.0
+    image: redis:7.2-alpine
     command: ["redis-server", "/etc/redis/redis.conf"]
     volumes:
       - ./redis/redis.conf:/etc/redis/redis.conf:ro
@@ -14,63 +16,75 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 2s
-      retries: 10
+      retries: 15
 
   backend:
     build:
-      context: ./backend
-      dockerfile: ../Dockerfile
+      context: .
+      dockerfile: Dockerfile
       args:
-        APP_DIR: app
+        APP_DIR: backend
     environment:
       BACKEND_HANG: "2.0"
     expose:
       - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   proxy-a:
     build:
-      context: ./proxy
-      dockerfile: ../Dockerfile
+      context: .
+      dockerfile: Dockerfile
       args:
-        APP_DIR: app
+        APP_DIR: proxy
     environment:
       PROXY_ID: "proxy-a"
       REDIS_URL: "redis://redis:6379/0"
       BACKEND_URL: "http://backend:8000"
       BACKEND_TIMEOUT: "2.5"
+      FAILURE_THRESHOLD: "3"
+      COOLDOWN_MS: "5000"
+      PROBE_TTL_MS: "10000"
     depends_on:
       redis:
         condition: service_healthy
       backend:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "8081:8000"
 
   proxy-b:
     build:
-      context: ./proxy
-      dockerfile: ../Dockerfile
+      context: .
+      dockerfile: Dockerfile
       args:
-        APP_DIR: app
+        APP_DIR: proxy
     environment:
       PROXY_ID: "proxy-b"
       REDIS_URL: "redis://redis:6379/0"
       BACKEND_URL: "http://backend:8000"
       BACKEND_TIMEOUT: "2.5"
+      FAILURE_THRESHOLD: "3"
+      COOLDOWN_MS: "5000"
+      PROBE_TTL_MS: "10000"
     depends_on:
       redis:
         condition: service_healthy
       backend:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "8082:8000"
 
   web:
     build:
-      context: ./web
-      dockerfile: ../Dockerfile
+      context: .
+      dockerfile: Dockerfile
       args:
-        APP_DIR: app
+        APP_DIR: web
     environment:
       PROXY_A_URL: "http://proxy-a:8000"
       PROXY_B_URL: "http://proxy-b:8000"

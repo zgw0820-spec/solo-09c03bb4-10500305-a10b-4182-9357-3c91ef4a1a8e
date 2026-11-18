@@ -39,18 +39,27 @@ def scripts(r):
     return pre, rep
 
 
-def pre(pre_script, r, proxy="proxy-a", now=None):
+def pre(pre_script, r, proxy="proxy-a", now=None, ttl=PROBE_TTL_MS):
     now = now or int(time.time() * 1000)
     allowed, state, gen, reason = pre_script(
-        keys=[KEY], args=[now, COOLDOWN_MS, THRESHOLD, proxy, PROBE_TTL_MS]
+        keys=[KEY], args=[now, COOLDOWN_MS, THRESHOLD, proxy, ttl]
     )
     return {"allowed": bool(allowed), "state": state, "generation": int(gen), "reason": reason}
+
+
+def trip_open(pre_script, rep_script, r, proxy="proxy-a"):
+    """三次超时让全局熔断器进入 OPEN，返回 opened_at 与 OPEN 代。"""
+    for _ in range(THRESHOLD):
+        d = pre(pre_script, r, proxy)
+        report(rep_script, r, d["generation"], False, proxy)
+    assert r.hget(KEY, "state") == "OPEN"
+    return int(r.hget(KEY, "opened_at")), int(r.hget(KEY, "generation"))
 
 
 def report(rep_script, r, gen, success, proxy="proxy-a", now=None):
     now = now or int(time.time() * 1000)
     applied, state, new_gen, failures = rep_script(
-        keys=[KEY], args=[now, THRESHOLD, COOLDOWN_MS, proxy, gen, 1 if success else 0, PROBE_TTL_MS]
+        keys=[KEY], args=[now, THRESHOLD, COOLDOWN_MS, proxy, gen, 1 if success else 0]
     )
     return {"applied": bool(applied), "state": state,
             "generation": int(new_gen), "failures": int(failures)}
@@ -190,6 +199,135 @@ def test_probe_lease_expiry_allows_recovery_after_proxy_exit(r, scripts):
     assert again["allowed"] and again["state"] == "HALF_OPEN"
     out = report(rep_script, r, again["generation"], True, "proxy-b", now=opened_at + 20_100)
     assert out["state"] == "CLOSED"
+
+
+def test_same_proxy_concurrent_requests_get_only_one_probe(r, scripts):
+    """同一份探测权只放行一条真实请求：探测持有者自己的并发请求也要拒绝。"""
+    pre_script, rep_script = scripts
+    opened_at, _ = trip_open(pre_script, rep_script, r)
+
+    first = pre(pre_script, r, "proxy-a", now=opened_at + 5_000)
+    assert first["allowed"] and first["state"] == "HALF_OPEN"
+    assert r.get(PROBE) == "proxy-a"
+
+    # 同一代理的第二个、第三个并发请求（探测仍在途）全部快速拒绝
+    for delta in (1, 2, 3):
+        other = pre(pre_script, r, "proxy-a", now=opened_at + 5_000 + delta)
+        assert not other["allowed"], "同一代理的并发请求不应再获得探测权"
+        assert other["reason"] == "PROBE_IN_PROGRESS"
+        assert other["generation"] == first["generation"]
+
+    # 另一个代理同样拒绝
+    peer = pre(pre_script, r, "proxy-b", now=opened_at + 5_010)
+    assert not peer["allowed"] and peer["reason"] == "PROBE_IN_PROGRESS"
+
+    # 只有最初的探测结果能推进状态机
+    out = report(rep_script, r, first["generation"], True, "proxy-a",
+                 now=opened_at + 5_100)
+    assert out["applied"] is True and out["state"] == "CLOSED"
+
+
+def test_stale_probe_success_cannot_clear_takeover_probe_lease(r, scripts):
+    """关键缺陷回归：旧探测停顿超过租约、另一代理接手后，旧探测的成功结果
+    既不能提前恢复转发，也不能清除接手者刚拿到的探测权。"""
+    pre_script, rep_script = scripts
+    opened_at, _ = trip_open(pre_script, rep_script, r)
+
+    # proxy-a 抢到探测权，但在上报结果前停顿超过租约期限
+    old = pre(pre_script, r, "proxy-a", now=opened_at + 5_000)
+    assert old["allowed"] and old["state"] == "HALF_OPEN"
+
+    # 租约自然过期（停顿超过 PROBE_TTL_MS，这里直接让 key 过期）
+    r.delete(PROBE)
+    assert r.get(PROBE) is None
+
+    # proxy-b 接手：拿到新的探测权，代数必须前进，旧探测因此失效
+    takeover = pre(pre_script, r, "proxy-b", now=opened_at + 5_000 + PROBE_TTL_MS + 100)
+    assert takeover["allowed"] and takeover["state"] == "HALF_OPEN"
+    assert takeover["generation"] > old["generation"]
+    assert r.get(PROBE) == "proxy-b"
+
+    # 旧探测迟到的成功结果：必须被忽略
+    stale_ok = report(rep_script, r, old["generation"], True, "proxy-a",
+                      now=opened_at + 5_000 + PROBE_TTL_MS + 200)
+    assert stale_ok["applied"] is False
+    assert r.hget(KEY, "state") == "HALF_OPEN"
+    assert r.get(PROBE) == "proxy-b", "旧结果不得清除接手者的探测权"
+    assert r.hget(KEY, "probe_owner") == "proxy-b"
+
+    # 旧探测迟到的失败结果同样无效
+    stale_fail = report(rep_script, r, old["generation"], False, "proxy-a",
+                        now=opened_at + 5_000 + PROBE_TTL_MS + 300)
+    assert stale_fail["applied"] is False
+    assert r.hget(KEY, "state") == "HALF_OPEN"
+
+    # 期间其它请求仍被拒绝（同一份有效探测权只放行一条真实请求）
+    blocked = pre(pre_script, r, "proxy-a",
+                  now=opened_at + 5_000 + PROBE_TTL_MS + 400)
+    assert not blocked["allowed"] and blocked["reason"] == "PROBE_IN_PROGRESS"
+
+    # 只有接手者的结果能决定恢复
+    ok = report(rep_script, r, takeover["generation"], True, "proxy-b",
+                now=opened_at + 5_000 + PROBE_TTL_MS + 500)
+    assert ok["applied"] is True and ok["state"] == "CLOSED"
+
+
+def test_stale_takeover_failure_reopens_cooldown(r, scripts):
+    """接手探测失败时重新冷却；旧探测迟到的成功不能把它改回 CLOSED。"""
+    pre_script, rep_script = scripts
+    opened_at, _ = trip_open(pre_script, rep_script, r)
+
+    old = pre(pre_script, r, "proxy-a", now=opened_at + 5_000)
+    r.delete(PROBE)  # 租约过期
+    takeover = pre(pre_script, r, "proxy-b", now=opened_at + 5_000 + PROBE_TTL_MS + 100)
+    assert takeover["generation"] > old["generation"]
+
+    fail = report(rep_script, r, takeover["generation"], False, "proxy-b",
+                  now=opened_at + 5_000 + PROBE_TTL_MS + 200)
+    assert fail["applied"] is True and fail["state"] == "OPEN"
+    assert r.get(PROBE) is None
+
+    stale_ok = report(rep_script, r, old["generation"], True, "proxy-a",
+                      now=opened_at + 5_000 + PROBE_TTL_MS + 300)
+    assert stale_ok["applied"] is False
+    assert r.hget(KEY, "state") == "OPEN"
+    # 新冷却期内仍快速拒绝
+    d = pre(pre_script, r, "proxy-a", now=opened_at + 5_000 + PROBE_TTL_MS + 400)
+    assert not d["allowed"] and d["reason"] == "COOLDOWN"
+
+
+def test_probe_result_from_non_owner_is_ignored(r, scripts):
+    """半开期只有探测持有者的上报有效；伪造/其它代理的结果无效。"""
+    pre_script, rep_script = scripts
+    opened_at, _ = trip_open(pre_script, rep_script, r)
+
+    probe = pre(pre_script, r, "proxy-a", now=opened_at + 5_000)
+    assert probe["allowed"]
+    # 同代其它代理（未被放行）不能借相同代数上报成功
+    forged = report(rep_script, r, probe["generation"], True, "proxy-b",
+                    now=opened_at + 5_050)
+    assert forged["applied"] is False
+    assert r.hget(KEY, "state") == "HALF_OPEN"
+    assert r.get(PROBE) == "proxy-a"
+
+    ok = report(rep_script, r, probe["generation"], True, "proxy-a",
+                now=opened_at + 5_100)
+    assert ok["applied"] is True and ok["state"] == "CLOSED"
+
+
+def test_probe_lease_has_ttl_and_expires(r, scripts):
+    """探测权必须是带 TTL 的租约：到期后自动释放。"""
+    pre_script, rep_script = scripts
+    opened_at, _ = trip_open(pre_script, rep_script, r)
+    d = pre(pre_script, r, "proxy-a", now=opened_at + 5_000, ttl=300)
+    assert d["allowed"]
+    ttl = r.pttl(PROBE)
+    assert 0 < ttl <= 300
+    time.sleep(0.45)
+    assert r.get(PROBE) is None
+    # 到期后另一个代理可接手
+    again = pre(pre_script, r, "proxy-b", now=opened_at + 5_000 + 500)
+    assert again["allowed"] and again["generation"] > d["generation"]
 
 
 def test_redis_state_persistence_simulation(r, scripts):

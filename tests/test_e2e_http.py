@@ -58,12 +58,13 @@ def stack():
     redis.Redis.from_url(REDIS_URL).delete("cb:state", "cb:state:probe")
 
     _spawn("backend", BACKEND_PORT, {"PROXY_ID": "backend", "BACKEND_HANG": "2"})
-    _spawn("proxy", PROXY_A_PORT, {
-        "PROXY_ID": "proxy-a", "REDIS_URL": REDIS_URL,
-        "BACKEND_URL": f"http://127.0.0.1:{BACKEND_PORT}", "BACKEND_TIMEOUT": "2.5"})
-    _spawn("proxy", PROXY_B_PORT, {
-        "PROXY_ID": "proxy-b", "REDIS_URL": REDIS_URL,
-        "BACKEND_URL": f"http://127.0.0.1:{BACKEND_PORT}", "BACKEND_TIMEOUT": "2.5"})
+    for port, proxy in ((PROXY_A_PORT, "proxy-a"), (PROXY_B_PORT, "proxy-b")):
+        _spawn("proxy", port, {
+            "PROXY_ID": proxy, "REDIS_URL": REDIS_URL,
+            "BACKEND_URL": f"http://127.0.0.1:{BACKEND_PORT}",
+            "BACKEND_TIMEOUT": "2.5",
+            # 自测用更短的冷却与租约，语义与生产默认（5s/10s）完全一致
+            "COOLDOWN_MS": "1500", "PROBE_TTL_MS": "2500"})
     yield
     for proc in PROCS:
         proc.send_signal(signal.SIGTERM)
@@ -129,8 +130,8 @@ def test_half_open_single_probe_and_recovery(client):
         _diag(client, port)
     assert _diag(client, PROXY_B_PORT).json()["reason"] == "COOLDOWN"
 
-    # 冷却 5 秒
-    time.sleep(5.2)
+    # 冷却（自测环境 1.5s）
+    time.sleep(1.7)
     # 半开期第一个请求成为唯一探测；后端仍是 timeout -> 探测失败重新冷却
     probe = _diag(client, PROXY_A_PORT)
     assert probe.json()["is_probe"] is True
@@ -140,7 +141,7 @@ def test_half_open_single_probe_and_recovery(client):
     assert other.json()["reason"] == "COOLDOWN"
 
     # 再冷却一轮，这次后端恢复，探测成功
-    time.sleep(5.2)
+    time.sleep(1.7)
     client.post(f"http://127.0.0.1:{BACKEND_PORT}/admin/mode", json={"mode": "normal"})
     probe2 = _diag(client, PROXY_B_PORT)
     body = probe2.json()
@@ -155,7 +156,7 @@ def test_only_one_probe_allowed_in_half_open(client):
     client.post(f"http://127.0.0.1:{BACKEND_PORT}/admin/mode", json={"mode": "timeout"})
     for port in (PROXY_A_PORT, PROXY_B_PORT, PROXY_A_PORT):
         _diag(client, port)
-    time.sleep(5.2)
+    time.sleep(1.7)
     # 用慢后端保证探测在途：backend timeout 模式挂 2s，先抢探测再立刻打第二个代理
     t0 = time.time()
     probe_resp = []
@@ -166,11 +167,91 @@ def test_only_one_probe_allowed_in_half_open(client):
     t.start()
     time.sleep(0.4)  # 等预检通过、探测在途
     r = _diag(client, PROXY_B_PORT)
+    # 同一代理的第二个并发请求同样必须被拒（原缺陷：被当成第二个探测放行）
+    same_proxy = _diag(client, PROXY_A_PORT)
     t.join()
     assert r.status_code == 503
     assert r.json()["reason"] == "PROBE_IN_PROGRESS"
+    assert same_proxy.status_code == 503
+    assert same_proxy.json()["reason"] == "PROBE_IN_PROGRESS"
     assert probe_resp[0].json()["is_probe"] is True
+    # 探测成功（后端仍 timeout，但这次只校验单探测语义：探测结果被采纳）
+    assert probe_resp[0].json()["cb_result_applied"] is True
     assert time.time() - t0 < 3
+
+
+def test_same_proxy_concurrent_burst_runs_single_request(client):
+    """同一代理在冷却结束后被并发打三次：只有一条真实请求到达后端。"""
+    client.post(f"http://127.0.0.1:{BACKEND_PORT}/admin/mode", json={"mode": "timeout"})
+    for port in (PROXY_A_PORT, PROXY_B_PORT, PROXY_A_PORT):
+        _diag(client, port)
+    time.sleep(1.7)
+    # 后端 timeout 模式挂 2s，保证探测在途期间发出其余并发请求
+
+    import threading
+    results: list = []
+    lock = threading.Lock()
+
+    def fire():
+        r = _diag(client, PROXY_A_PORT, "DEV-PAR")
+        with lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=fire) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    probes = [r for r in results if r.json().get("is_probe") is True]
+    rejected = [r for r in results if r.json().get("reason") == "PROBE_IN_PROGRESS"]
+    assert len(probes) == 1, [r.json() for r in results]
+    assert len(rejected) == 2, [r.json() for r in results]
+    # 唯一的探测结果被采纳（后端仍超时 -> 重新冷却）
+    assert probes[0].json()["cb_result_applied"] is True
+    assert probes[0].json()["cb"]["state"] == "OPEN"
+
+
+def test_lease_takeover_old_probe_cannot_restore(client):
+    """探测停顿超过租约、另一代理接手后，旧探测迟到的成功不得提前恢复转发。
+
+    直接用 Lua 脚本按毫秒时间线精确复现租约交接（不依赖真实停顿）。
+    """
+    import redis
+    from pathlib import Path
+    rdb = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    lua_dir = ROOT / "proxy" / "app"
+    pre = rdb.register_script((lua_dir / "preflight.lua").read_text(encoding="utf-8"))
+    rep = rdb.register_script((lua_dir / "report_result.lua").read_text(encoding="utf-8"))
+    key = "test:e2e:lease"
+    rdb.delete(key, key + ":probe", "cb:state", "cb:state:probe")
+    cooldown, ttl, threshold = 1500, 2500, 3
+
+    def p(who, now):
+        return pre(keys=[key], args=[now, cooldown, threshold, who, ttl])
+
+    def q(gen, ok, who, now):
+        return rep(keys=[key], args=[now, threshold, cooldown, who, gen, int(ok)])
+
+    now = int(time.time() * 1000)
+    for _ in range(threshold):
+        d = p("proxy-a", now)
+        q(d[2], False, "proxy-a", now)
+
+    old = p("proxy-a", now + cooldown)
+    assert old[0] == 1 and old[1] == "HALF_OPEN"
+    rdb.delete(key + ":probe")  # 租约到期（旧探测仍停顿）
+    takeover = p("proxy-b", now + cooldown + ttl + 100)
+    assert takeover[0] == 1 and takeover[2] > old[2]
+
+    stale = q(old[2], True, "proxy-a", now + cooldown + ttl + 200)
+    assert stale[0] == 0, "旧探测结果必须被忽略"
+    assert rdb.hget(key, "state") == "HALF_OPEN"
+    assert rdb.get(key + ":probe") == "proxy-b"
+    # 接手者结果才有效
+    assert q(takeover[2], True, "proxy-b", now + cooldown + ttl + 300)[0] == 1
+    assert rdb.hget(key, "state") == "CLOSED"
+    rdb.delete(key, key + ":probe")
 
 
 def test_redis_down_explicitly_rejects_forwarding(client):

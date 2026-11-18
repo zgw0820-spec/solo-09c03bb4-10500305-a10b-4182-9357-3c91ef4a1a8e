@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from redis import Redis
 
@@ -72,7 +73,11 @@ def cb_reset() -> JSONResponse:
 
 
 @app.get("/diagnose/{device_id}")
-async def diagnose(device_id: str, request: Request) -> JSONResponse:
+async def diagnose(
+    device_id: str,
+    request: Request,
+    delay: float = Query(0.0, description="自测用：让后端额外挂起指定秒数"),
+) -> JSONResponse:
     """诊断入口：先过熔断器，再转发给模拟后端。"""
     request_id = uuid.uuid4().hex[:8]
 
@@ -115,13 +120,19 @@ async def diagnose(device_id: str, request: Request) -> JSONResponse:
     success = False
     backend_payload: dict
     http_status = 200
+    backend_latency_ms = 0
+    started = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=BACKEND_TIMEOUT) as client:
-            resp = await client.get(f"{BACKEND_URL}/diagnose/{device_id}")
+            url = f"{BACKEND_URL}/diagnose/{device_id}"
+            params = {"delay": delay} if delay > 0 else None
+            resp = await client.get(url, params=params)
+            backend_latency_ms = int((time.perf_counter() - started) * 1000)
             http_status = resp.status_code
             backend_payload = resp.json()
             success = resp.is_success
     except httpx.TimeoutException:
+        backend_latency_ms = int((time.perf_counter() - started) * 1000)
         backend_payload = {
             "ok": False,
             "error": "BACKEND_TIMEOUT",
@@ -129,6 +140,7 @@ async def diagnose(device_id: str, request: Request) -> JSONResponse:
         }
         http_status = 504
     except httpx.HTTPError as exc:
+        backend_latency_ms = int((time.perf_counter() - started) * 1000)
         backend_payload = {
             "ok": False,
             "error": "BACKEND_UNREACHABLE",
@@ -150,11 +162,14 @@ async def diagnose(device_id: str, request: Request) -> JSONResponse:
         "request_id": request_id,
         "is_probe": is_probe,
         "backend_status": http_status,
+        "backend_latency_ms": backend_latency_ms,
         "device_id": device_id,
         "backend": backend_payload,
     }
     if report is not None:
         body["cb"] = report
+        # 结果是否被状态机采纳：applied=false 说明这是过期（迟到）结果
+        body["cb_result_applied"] = report["applied"]
         headers = _cb_headers(report)
     else:
         body["cb"] = {"state": "UNKNOWN", "error": report_error}

@@ -4,12 +4,14 @@
 - 所有状态判断与转换都在 Redis Lua 脚本中原子完成，避免多代理竞争。
 - generation（代数）在每次状态切换时递增：请求带着预检时的代数上报结果，
   代数过期的“迟到结果”会被脚本直接忽略，不能推翻新一轮成功。
-- 探测权通过带 TTL 的 key 发放：代理在探测途中退出，租约到期后其它代理
-  仍可发起下一轮探测，恢复流程不会卡死。
+- 探测权通过带 TTL 的 key 发放：一份租约只放行一条真实请求（持有代理自己
+  的并发请求同样拒绝）；代理在探测途中退出或停顿超过租约，租约到期后其它
+  代理可接手。接手时代数 +1，旧探测迟到的结果全部失效。
 - Redis 不可用时抛出 RedisUnavailable，上层明确拒绝转发，绝不放行。
 """
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -19,11 +21,19 @@ from redis.exceptions import RedisError
 STATE_KEY = "cb:state"
 PROBE_KEY = "cb:state:probe"
 
-# 连续超时阈值与冷却时长：题目固定要求
-FAILURE_THRESHOLD = 3
-COOLDOWN_MS = 5_000
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# 连续超时阈值与冷却时长：默认按题目固定要求，可用环境变量覆盖（自测用）
+FAILURE_THRESHOLD = _env_int("FAILURE_THRESHOLD", 3)
+COOLDOWN_MS = _env_int("COOLDOWN_MS", 5_000)
 # 探测权租约：必须大于单次探测的 HTTP 超时，留足余量
-PROBE_TTL_MS = 10_000
+PROBE_TTL_MS = _env_int("PROBE_TTL_MS", 10_000)
 
 _HERE = Path(__file__).parent
 
@@ -82,7 +92,6 @@ class CircuitBreaker:
                     self._proxy_id,
                     generation,
                     1 if success else 0,
-                    PROBE_TTL_MS,
                 ],
             )
         except RedisError as exc:
@@ -98,19 +107,28 @@ class CircuitBreaker:
     def status(self) -> dict:
         """读取当前熔断状态（只读，供状态展示页使用）。"""
         try:
-            exists = self._r.exists(STATE_KEY)
-            if not exists:
+            now = self._now_ms()
+            base = {
+                "cooldown_ms": COOLDOWN_MS,
+                "probe_ttl_ms": PROBE_TTL_MS,
+                "failure_threshold": FAILURE_THRESHOLD,
+            }
+            if not self._r.exists(STATE_KEY):
                 return {
+                    **base,
                     "state": "CLOSED",
                     "generation": 0,
                     "failures": 0,
+                    "opened_at": 0,
                     "cooldown_remaining_ms": 0,
                     "probe_in_progress": False,
                     "probe_owner": None,
+                    "probe_lease_remaining_ms": 0,
                 }
             data = self._r.hgetall(STATE_KEY)
-            probe_owner = self._r.get(PROBE_KEY)
-            now = self._now_ms()
+            # 以带 TTL 的租约 key 为准：它是唯一能放行探测的凭据
+            probe_ttl = self._r.pttl(PROBE_KEY)
+            probe_owner = self._r.get(PROBE_KEY) if probe_ttl >= 0 else None
             state = data.get("state", "CLOSED")
             remaining = 0
             if state == "OPEN":
@@ -119,12 +137,15 @@ class CircuitBreaker:
                     COOLDOWN_MS - (now - int(data.get("opened_at", now))),
                 )
             return {
+                **base,
                 "state": state,
                 "generation": int(data.get("generation", 0)),
                 "failures": int(data.get("failures", 0)),
+                "opened_at": int(data.get("opened_at", 0)),
                 "cooldown_remaining_ms": remaining,
                 "probe_in_progress": probe_owner is not None,
                 "probe_owner": probe_owner,
+                "probe_lease_remaining_ms": probe_ttl if probe_owner else 0,
             }
         except RedisError as exc:
             raise RedisUnavailable(str(exc)) from exc

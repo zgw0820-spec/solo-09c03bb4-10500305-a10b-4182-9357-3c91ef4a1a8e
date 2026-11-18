@@ -1,9 +1,11 @@
+# docker compose build 的构建上下文是仓库根目录，通知 docker 跳过无关文件
+.git
+.gitignore
 __pycache__/
 *.pyc
+.pytest_cache/
 .venv/
 venv/
-.pytest_cache/
 *.log
-.redis-data/
 redis-data/
-.git/
+tests/e2e_*.log
